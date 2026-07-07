@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional, List
 from dotenv import load_dotenv
+from urllib.parse import urlencode
 
 # Load environment variables from both root and discord_bot directories
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
@@ -84,6 +85,9 @@ class AppSettingsRequest(BaseModel):
     version: str
     dev_message: Optional[str] = None
 
+class UserPasswordUpdateRequest(BaseModel):
+    new_password: str
+
 class UserCreateRequest(BaseModel):
     username: str
     password: str
@@ -118,6 +122,11 @@ class DiscordConfigRequest(BaseModel):
     discord_channel_id: Optional[str] = None
     discord_guild_name: Optional[str] = None
     discord_channel_name: Optional[str] = None
+    discord_log_enabled: Optional[bool] = False
+    discord_welcome_enabled: Optional[bool] = False
+    discord_welcome_msg: Optional[str] = "Welcome to the Server!"
+    discord_role_on_register: Optional[str] = None
+    discord_dm_notifications: Optional[bool] = True
 
 # --- Authentication Dependency ---
 def get_current_creator(authorization: Optional[str] = Header(None), db: Session = Depends(get_db)) -> Creator:
@@ -143,7 +152,7 @@ def get_current_creator(authorization: Optional[str] = Header(None), db: Session
 # --- Creator API Endpoints ---
 
 from google.oauth2 import id_token
-from google.auth.transport import requests
+from google.auth.transport import requests as google_requests
 
 class GoogleLoginRequest(BaseModel):
     token: str
@@ -155,7 +164,7 @@ def google_login(req: GoogleLoginRequest, db: Session = Depends(get_db)):
         CLIENT_ID = "588407370614-p2neukq31drhm95vurebqinlab0q1ltp.apps.googleusercontent.com"
         idinfo = id_token.verify_oauth2_token(
             req.token, 
-            requests.Request(), 
+            google_requests.Request(), 
             CLIENT_ID,
             clock_skew_in_seconds=315360000 # 10 years tolerance
         )
@@ -197,7 +206,7 @@ def log_app_action(db: Session, app_id: int, action: str, description: str):
 @app.get("/api/creator/apps")
 def get_creator_apps(current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
     applications = db.query(Application).filter(Application.creator_id == current_creator.id).all()
-    return [{"id": app.id, "app_name": app.app_name, "owner_id": app.owner_id, "secret": app.secret, "status": app.status, "webhook_url": app.webhook_url, "version": app.version, "dev_message": app.dev_message, "created_at": app.created_at, "discord_guild_id": app.discord_guild_id, "discord_channel_id": app.discord_channel_id, "discord_guild_name": app.discord_guild_name, "discord_channel_name": app.discord_channel_name} for app in applications]
+    return [{"id": app.id, "app_name": app.app_name, "owner_id": app.owner_id, "secret": app.secret, "status": app.status, "webhook_url": app.webhook_url, "version": app.version, "dev_message": app.dev_message, "created_at": app.created_at, "discord_guild_id": app.discord_guild_id, "discord_channel_id": app.discord_channel_id, "discord_guild_name": app.discord_guild_name, "discord_channel_name": app.discord_channel_name, "discord_log_enabled": app.discord_log_enabled, "discord_welcome_enabled": app.discord_welcome_enabled, "discord_welcome_msg": app.discord_welcome_msg, "discord_role_on_register": app.discord_role_on_register, "discord_dm_notifications": app.discord_dm_notifications} for app in applications]
 
 @app.post("/api/creator/apps/create")
 def create_app(req: AppCreateRequest, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
@@ -233,6 +242,27 @@ def update_app_settings(app_id: int, req: AppSettingsRequest, current_creator: C
     app.dev_message = req.dev_message
     db.commit()
     return {"message": "Settings updated"}
+
+@app.put("/api/creator/apps/{app_id}/rename")
+def rename_app(app_id: int, new_name: str, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if not new_name or new_name.strip() == "":
+        raise HTTPException(status_code=400, detail="New name cannot be empty")
+    app.app_name = new_name.strip()
+    db.commit()
+    return {"message": "Application renamed", "app_name": app.app_name}
+
+@app.post("/api/creator/apps/{app_id}/reset-secret")
+def reset_app_secret(app_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    new_secret = secrets.token_hex(32)
+    app.secret = new_secret
+    db.commit()
+    return {"message": "Secret reset", "secret": new_secret}
 
 @app.post("/api/creator/apps/{app_id}/users")
 def add_app_user(app_id: int, req: UserCreateRequest, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
@@ -289,6 +319,42 @@ def toggle_user_ban(app_id: int, user_id: int, current_creator: Creator = Depend
     log_app_action(db, app.id, "USER_BAN_TOGGLE", f"Changed status of user {user.username} to {user.status}")
     return {"message": f"User status changed to {user.status}"}
 
+@app.post("/api/creator/apps/{app_id}/users/{user_id}/ban")
+def ban_user(app_id: int, user_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.app_id == app.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.status = "banned"
+    db.commit()
+    return {"message": "User banned"}
+
+@app.post("/api/creator/apps/{app_id}/users/{user_id}/unban")
+def unban_user(app_id: int, user_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.app_id == app.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.status = "active"
+    db.commit()
+    return {"message": "User unbanned"}
+
+@app.put("/api/creator/apps/{app_id}/users/{user_id}/password")
+def update_user_password(app_id: int, user_id: int, req: UserPasswordUpdateRequest, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app: raise HTTPException(status_code=404, detail="App not found")
+    user = db.query(AppUser).filter(AppUser.id == user_id, AppUser.app_id == app.id).first()
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+    
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
+    log_app_action(db, app.id, "USER_PASSWORD_CHANGED", f"Changed password for user {user.username}")
+    return {"message": "Password updated successfully"}
+
 @app.post("/api/creator/apps/{app_id}/licenses")
 def create_app_licenses(app_id: int, req: LicenseCreateRequest, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
     app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
@@ -339,6 +405,37 @@ def reset_license_hwid(app_id: int, license_id: int, current_creator: Creator = 
     log_app_action(db, app.id, "HWID_RESET", f"Reset HWID for license {lic.license_key}")
     return {"message": "HWID Reset Successful"}
 
+@app.post("/api/creator/apps/{app_id}/licenses/{license_id}/reset-ip")
+def reset_license_ip(app_id: int, license_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    lic = db.query(AppLicense).filter(AppLicense.id == license_id, AppLicense.app_id == app.id).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+    lic.last_ip = None
+    db.commit()
+    return {"message": "License IP reset"}
+
+@app.post("/api/creator/apps/{app_id}/licenses/{license_id}/extend")
+def extend_license(app_id: int, license_id: int, days: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    lic = db.query(AppLicense).filter(AppLicense.id == license_id, AppLicense.app_id == app.id).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+    if lic.expires_at:
+        lic.expires_at += timedelta(days=days)
+    else:
+        # If never set, set based on duration_days if any
+        if lic.duration_days > 0:
+            lic.expires_at = datetime.utcnow() + timedelta(days=lic.duration_days + days)
+        else:
+            lic.expires_at = datetime.utcnow() + timedelta(days=days)
+    db.commit()
+    return {"message": f"License extended by {days} days", "new_expiry": lic.expires_at.isoformat()}
+
 @app.post("/api/creator/apps/{app_id}/licenses/{license_id}/toggle-ban")
 def toggle_license_ban(app_id: int, license_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
     app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
@@ -351,12 +448,60 @@ def toggle_license_ban(app_id: int, license_id: int, current_creator: Creator = 
     log_app_action(db, app.id, "LICENSE_BAN_TOGGLE", f"Changed status of license {lic.license_key} to {lic.status}")
     return {"message": f"License status changed to {lic.status}"}
 
+@app.post("/api/creator/apps/{app_id}/licenses/{license_id}/ban")
+def ban_license(app_id: int, license_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    lic = db.query(AppLicense).filter(AppLicense.id == license_id, AppLicense.app_id == app.id).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+    lic.status = "banned"
+    db.commit()
+    return {"message": "License banned"}
+
+@app.post("/api/creator/apps/{app_id}/licenses/{license_id}/unban")
+def unban_license(app_id: int, license_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    lic = db.query(AppLicense).filter(AppLicense.id == license_id, AppLicense.app_id == app.id).first()
+    if not lic:
+        raise HTTPException(status_code=404, detail="License not found")
+    lic.status = "active"
+    db.commit()
+    return {"message": "License unbanned"}
+
 @app.get("/api/creator/apps/{app_id}/logs")
 def get_app_logs(app_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
     app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
     if not app: raise HTTPException(status_code=404, detail="App not found")
     logs = db.query(AppLog).filter(AppLog.app_id == app.id).order_by(AppLog.id.desc()).limit(50).all()
     return [{"id": l.id, "action": l.action, "description": l.description, "created_at": l.created_at.isoformat()} for l in logs]
+
+@app.delete("/api/creator/apps/{app_id}/clean-banned")
+def clean_banned_entities(app_id: int, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
+    app = db.query(Application).filter(Application.id == app_id, Application.creator_id == current_creator.id).first()
+    if not app: raise HTTPException(status_code=404, detail="App not found")
+    
+    banned_users = db.query(AppUser).filter(AppUser.app_id == app_id, AppUser.status == "banned").all()
+    banned_lics = db.query(AppLicense).filter(AppLicense.app_id == app_id, AppLicense.status == "banned").all()
+    
+    user_count = len(banned_users)
+    lic_count = len(banned_lics)
+    
+    for u in banned_users:
+        db.delete(u)
+    for l in banned_lics:
+        db.delete(l)
+        
+    db.commit()
+    log_app_action(db, app.id, "CLEAN_BANNED", f"Cleaned {user_count} banned users and {lic_count} banned licenses")
+    return {
+        "message": f"Successfully deleted {user_count} banned users and {lic_count} banned licenses",
+        "users_deleted": user_count,
+        "licenses_deleted": lic_count
+    }
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
@@ -397,6 +542,11 @@ def update_app_discord_config(app_id: int, req: DiscordConfigRequest, current_cr
     app.discord_channel_id = req.discord_channel_id
     app.discord_guild_name = req.discord_guild_name
     app.discord_channel_name = req.discord_channel_name
+    app.discord_log_enabled = req.discord_log_enabled
+    app.discord_welcome_enabled = req.discord_welcome_enabled
+    app.discord_welcome_msg = req.discord_welcome_msg
+    app.discord_role_on_register = req.discord_role_on_register
+    app.discord_dm_notifications = req.discord_dm_notifications
     db.commit()
     return {"message": "Discord integration settings updated"}
 
@@ -415,7 +565,16 @@ def get_app_by_discord_channel(channel_id: str, current_creator: Creator = Depen
         "secret": app.secret,
         "status": app.status,
         "version": app.version,
-        "dev_message": app.dev_message
+        "dev_message": app.dev_message,
+        "discord_guild_id": app.discord_guild_id,
+        "discord_channel_id": app.discord_channel_id,
+        "discord_guild_name": app.discord_guild_name,
+        "discord_channel_name": app.discord_channel_name,
+        "discord_log_enabled": app.discord_log_enabled,
+        "discord_welcome_enabled": app.discord_welcome_enabled,
+        "discord_welcome_msg": app.discord_welcome_msg,
+        "discord_role_on_register": app.discord_role_on_register,
+        "discord_dm_notifications": app.discord_dm_notifications
     }
 
 # --- Discord OAuth2 Endpoints ---
@@ -423,6 +582,21 @@ DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI", os.getenv("LEGITAUTH_API_URL", "http://localhost:8000") + "/api/creator/discord/callback")
 DISCORD_BOT_PERMISSIONS = "8"  # Administrator permissions
+FRONTEND_URL = os.getenv("LEGITAUTH_API_URL", "http://localhost:8000")
+
+def build_bot_invite_url(guild_id: Optional[str] = None) -> str:
+    client_id = DISCORD_CLIENT_ID or "1522600480662880347"
+    params = {
+        "client_id": client_id,
+        "permissions": DISCORD_BOT_PERMISSIONS,
+        "scope": "bot applications.commands",
+        "response_type": "code",
+        "redirect_uri": DISCORD_REDIRECT_URI,
+    }
+    if guild_id:
+        params["guild_id"] = guild_id
+        params["disable_guild_select"] = "true"
+    return f"https://discord.com/api/oauth2/authorize?{urlencode(params)}"
 
 def refresh_discord_token(creator: Creator, db: Session):
     # Check if token needs refresh
@@ -456,53 +630,77 @@ def refresh_discord_token(creator: Creator, db: Session):
 def discord_login(current_creator: Creator = Depends(get_current_creator)):
     if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
         raise HTTPException(status_code=500, detail="Discord OAuth not configured")
+    # Get user's token so we can pass it in state
+    user_token = create_access_token(data={"email": current_creator.email, "id": current_creator.id})
     scopes = "identify guilds"
-    url = (
-        f"https://discord.com/oauth2/authorize?response_type=code"
-        f"&client_id={DISCORD_CLIENT_ID}"
-        f"&redirect_uri={DISCORD_REDIRECT_URI}"
-        f"&scope={scopes}"
-    )
+    params = {
+        "response_type": "code",
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "scope": scopes,
+        "state": user_token,
+    }
+    url = f"https://discord.com/api/oauth2/authorize?{urlencode(params)}"
     return {"auth_url": url}
 
 @app.get("/api/creator/discord/callback")
-def discord_callback(code: str, current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
-    if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="Discord OAuth not configured")
-    
-    # Exchange code for access token
-    data = {
-        "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    res = requests.post("https://discord.com/api/v10/oauth2/token", data=data, headers=headers)
-    if res.status_code != 200:
-        raise HTTPException(status_code=400, detail="Failed to get Discord token")
-    
-    token_data = res.json()
-    access_token = token_data["access_token"]
-    refresh_token = token_data.get("refresh_token")
-    expires_in = token_data["expires_in"]
-    
-    # Get Discord user info
-    user_res = requests.get("https://discord.com/api/v10/users/@me", headers={"Authorization": f"Bearer {access_token}"})
-    if user_res.status_code !=200:
-        raise HTTPException(status_code=400, detail="Failed to get Discord user")
-    user_data = user_res.json()
-    
-    # Update creator
-    current_creator.discord_id = user_data["id"]
-    current_creator.discord_access_token = access_token
-    current_creator.discord_refresh_token = refresh_token
-    current_creator.discord_token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
-    db.commit()
-    
-    # Redirect back to dashboard
-    return RedirectResponse(url="/#discord")
+def discord_callback(code: Optional[str] = None, state: Optional[str] = None, guild_id: Optional[str] = None, permissions: Optional[str] = None, db: Session = Depends(get_db)):
+    try:
+        # Bot invite callback (no state) — bot was added to the server
+        if not state:
+            return RedirectResponse(url=f"{FRONTEND_URL}/#discord")
+        
+        if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
+            raise HTTPException(status_code=500, detail="Discord OAuth not configured")
+        
+        # Verify the token from state to get current creator
+        payload = verify_access_token(state)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid state token")
+        
+        # Get creator from payload
+        creator = db.query(Creator).filter(Creator.email == payload.get("email")).first()
+        if not creator:
+            raise HTTPException(status_code=401, detail="Creator not found")
+        
+        # Exchange code for access token
+        data = {
+            "client_id": DISCORD_CLIENT_ID,
+            "client_secret": DISCORD_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": DISCORD_REDIRECT_URI,
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        res = requests.post("https://discord.com/api/v10/oauth2/token", data=data, headers=headers)
+        if res.status_code != 200:
+            print(f"Discord token exchange error: {res.status_code} {res.text}")
+            raise HTTPException(status_code=400, detail="Failed to get Discord token")
+        
+        token_data = res.json()
+        access_token = token_data["access_token"]
+        refresh_token = token_data.get("refresh_token")
+        expires_in = token_data["expires_in"]
+        
+        # Get Discord user info
+        user_res = requests.get("https://discord.com/api/v10/users/@me", headers={"Authorization": f"Bearer {access_token}"})
+        if user_res.status_code !=200:
+            print(f"Discord user info error: {user_res.status_code} {user_res.text}")
+            raise HTTPException(status_code=400, detail="Failed to get Discord user")
+        user_data = user_res.json()
+        
+        # Update creator
+        creator.discord_id = user_data["id"]
+        creator.discord_access_token = access_token
+        creator.discord_refresh_token = refresh_token
+        creator.discord_token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+        db.commit()
+        
+        # Redirect back to dashboard
+        return RedirectResponse(url=f"{FRONTEND_URL}/#discord")
+    except Exception as e:
+        print(f"Discord callback error: {e}")
+        return RedirectResponse(url=f"{FRONTEND_URL}/#discord")
 
 @app.get("/api/creator/discord/me")
 def get_discord_me(current_creator: Creator = Depends(get_current_creator), db: Session = Depends(get_db)):
@@ -548,16 +746,10 @@ def get_discord_guild_channels(guild_id: str, current_creator: Creator = Depends
 
 @app.get("/api/creator/discord/invite-url")
 def get_bot_invite_url(guild_id: Optional[str] = None):
-    if not DISCORD_CLIENT_ID:
-        raise HTTPException(status_code=500, detail="Discord client ID not set")
-    url = (
-        f"https://discord.com/api/oauth2/authorize?client_id={DISCORD_CLIENT_ID}"
-        f"&permissions={DISCORD_BOT_PERMISSIONS}"
-        f"&scope=bot%20applications.commands"
-    )
-    if guild_id:
-        url += f"&guild_id={guild_id}&disable_guild_select=true"
-    return {"invite_url": url}
+    return {
+        "invite_url": build_bot_invite_url(guild_id),
+        "redirect_uri": DISCORD_REDIRECT_URI,
+    }
 
 
 def send_discord_webhook(url: str, message: str):
